@@ -2,11 +2,19 @@ provider "aws" {
   region = "eu-west-1"
 
   # Make it faster by skipping something
-  skip_get_ec2_platforms      = true
+
   skip_metadata_api_check     = true
   skip_region_validation      = true
   skip_credentials_validation = true
-  skip_requesting_account_id  = true
+}
+
+data "aws_availability_zones" "available" {}
+
+data "aws_organizations_organization" "this" {}
+
+locals {
+  vpc_cidr = "10.0.0.0/16"
+  azs      = slice(data.aws_availability_zones.available.names, 0, 3)
 }
 
 ####################################################
@@ -18,24 +26,37 @@ module "lambda_function" {
 
   function_name = "${random_pet.this.id}-lambda-event-source-mapping"
   handler       = "index.lambda_handler"
-  runtime       = "python3.8"
+  runtime       = "python3.12"
 
-  source_path = "${path.module}/../fixtures/python3.8-app1"
+  source_path = "${path.module}/../fixtures/python-app1/index.py"
 
   event_source_mapping = {
     sqs = {
       event_source_arn        = aws_sqs_queue.this.arn
       function_response_types = ["ReportBatchItemFailures"]
+      scaling_config = {
+        maximum_concurrency = 20
+      }
     }
     dynamodb = {
       event_source_arn           = aws_dynamodb_table.this.stream_arn
       starting_position          = "LATEST"
       destination_arn_on_failure = aws_sqs_queue.failure.arn
-      filter_criteria = {
-        pattern = jsonencode({
-          eventName : ["INSERT"]
-        })
-      }
+      filter_criteria = [
+        {
+          pattern = jsonencode({
+            eventName : ["INSERT"]
+          })
+        },
+        {
+          pattern = jsonencode({
+            data : {
+              Temperature : [{ numeric : [">", 0, "<=", 100] }]
+              Location : ["Oslo"]
+            }
+          })
+        }
+      ]
     }
     kinesis = {
       event_source_arn  = aws_kinesis_stream.this.arn
@@ -74,6 +95,11 @@ module "lambda_function" {
     #          }
     #        }
     #      ]
+    #      self_managed_kafka_event_source_config = [
+    #        {
+    #          consumer_group_id = "example-consumer-group"
+    #        }
+    #      ]
     #      source_access_configuration = [
     #        {
     #          type = "SASL_SCRAM_512_AUTH",
@@ -92,6 +118,10 @@ module "lambda_function" {
   }
 
   allowed_triggers = {
+    config = {
+      principal        = "config.amazonaws.com"
+      principal_org_id = data.aws_organizations_organization.this.id
+    }
     sqs = {
       principal  = "sqs.amazonaws.com"
       source_arn = aws_sqs_queue.this.arn
@@ -201,21 +231,26 @@ resource "aws_kinesis_stream" "this" {
 }
 
 # Amazon MQ
-data "aws_vpc" "default" {
-  default = true
-}
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
 
-data "aws_security_group" "default" {
-  vpc_id = data.aws_vpc.default.id
-  name   = "default"
+  name = random_pet.this.id
+  cidr = local.vpc_cidr
+
+  azs            = local.azs
+  public_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k)]
+
+  enable_nat_gateway = false
 }
 
 resource "aws_mq_broker" "this" {
   broker_name        = random_pet.this.id
   engine_type        = "RabbitMQ"
-  engine_version     = "3.8.11"
+  engine_version     = "3.10.10"
   host_instance_type = "mq.t3.micro"
-  security_groups    = [data.aws_security_group.default.id]
+  security_groups    = [module.vpc.default_security_group_id]
+  subnet_ids         = slice(module.vpc.public_subnets, 0, 1)
 
   user {
     username = random_pet.this.id

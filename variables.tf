@@ -34,6 +34,18 @@ variable "create_lambda_function_url" {
   default     = false
 }
 
+variable "create_sam_metadata" {
+  description = "Controls whether the SAM metadata null resource should be created"
+  type        = bool
+  default     = false
+}
+
+variable "putin_khuylo" {
+  description = "Do you agree that Putin doesn't respect Ukrainian sovereignty and territorial integrity? More info: https://en.wikipedia.org/wiki/Putin_khuylo!"
+  type        = bool
+  default     = true
+}
+
 ###########
 # Function
 ###########
@@ -42,6 +54,12 @@ variable "lambda_at_edge" {
   description = "Set this to true if using Lambda@Edge, to enable publishing, limit the timeout, and allow edgelambda.amazonaws.com to invoke the function"
   type        = bool
   default     = false
+}
+
+variable "lambda_at_edge_logs_all_regions" {
+  description = "Whether to specify a wildcard in IAM policy used by Lambda@Edge to allow logging in all regions"
+  type        = bool
+  default     = true
 }
 
 variable "function_name" {
@@ -60,11 +78,6 @@ variable "runtime" {
   description = "Lambda Function runtime"
   type        = string
   default     = ""
-
-  #  validation {
-  #    condition     = can(var.create && contains(["nodejs10.x", "nodejs12.x", "java8", "java11", "python2.7", " python3.6", "python3.7", "python3.8", "dotnetcore2.1", "dotnetcore3.1", "go1.x", "ruby2.5", "ruby2.7", "provided"], var.runtime))
-  #    error_message = "The runtime value must be one of supported by AWS Lambda."
-  #  }
 }
 
 variable "lambda_role" {
@@ -77,6 +90,12 @@ variable "description" {
   description = "Description of your Lambda Function (or Layer)"
   type        = string
   default     = ""
+}
+
+variable "code_signing_config_arn" {
+  description = "Amazon Resource Name (ARN) for a Code Signing Configuration"
+  type        = string
+  default     = null
 }
 
 variable "layers" {
@@ -163,6 +182,12 @@ variable "tags" {
   default     = {}
 }
 
+variable "function_tags" {
+  description = "A map of tags to assign only to the lambda function"
+  type        = map(string)
+  default     = {}
+}
+
 variable "s3_object_tags" {
   description = "A map of tags to assign to S3 bucket object."
   type        = map(string)
@@ -205,6 +230,30 @@ variable "image_config_working_directory" {
   default     = null
 }
 
+variable "snap_start" {
+  description = "(Optional) Snap start settings for low-latency startups"
+  type        = bool
+  default     = false
+}
+
+variable "replace_security_groups_on_destroy" {
+  description = "(Optional) When true, all security groups defined in vpc_security_group_ids will be replaced with the default security group after the function is destroyed. Set the replacement_security_group_ids variable to use a custom list of security groups for replacement instead."
+  type        = bool
+  default     = null
+}
+
+variable "replacement_security_group_ids" {
+  description = "(Optional) List of security group IDs to assign to orphaned Lambda function network interfaces upon destruction. replace_security_groups_on_destroy must be set to true to use this attribute."
+  type        = list(string)
+  default     = null
+}
+
+variable "timeouts" {
+  description = "Define maximum timeout for creating, updating, and deleting Lambda Function resources"
+  type        = map(string)
+  default     = {}
+}
+
 ###############
 # Function URL
 ###############
@@ -225,6 +274,18 @@ variable "cors" {
   description = "CORS settings to be used by the Lambda Function URL"
   type        = any
   default     = {}
+}
+
+variable "invoke_mode" {
+  description = "Invoke mode of the Lambda Function URL. Valid values are BUFFERED (default) and RESPONSE_STREAM."
+  type        = string
+  default     = null
+}
+
+variable "s3_object_override_default_tags" {
+  description = "Whether to override the default_tags from provider? NB: S3 objects support a maximum of 10 tags."
+  type        = bool
+  default     = false
 }
 
 ########
@@ -371,6 +432,18 @@ variable "cloudwatch_logs_kms_key_id" {
   default     = null
 }
 
+variable "cloudwatch_logs_skip_destroy" {
+  description = "Whether to keep the log group (and any logs it may contain) at destroy time."
+  type        = bool
+  default     = false
+}
+
+variable "cloudwatch_logs_log_group_class" {
+  description = "Specified the log class of the log group. Possible values are: `STANDARD` or `INFREQUENT_ACCESS`"
+  type        = string
+  default     = null
+}
+
 variable "cloudwatch_logs_tags" {
   description = "A map of tags to assign to the resource."
   type        = map(string)
@@ -417,12 +490,30 @@ variable "role_tags" {
   default     = {}
 }
 
+variable "role_maximum_session_duration" {
+  description = "Maximum session duration, in seconds, for the IAM role"
+  type        = number
+  default     = 3600
+}
+
 ###########
 # Policies
 ###########
 
+variable "policy_name" {
+  description = "IAM policy name. It override the default value, which is the same as role_name"
+  type        = string
+  default     = null
+}
+
 variable "attach_cloudwatch_logs_policy" {
   description = "Controls whether CloudWatch Logs policy should be added to IAM role for Lambda Function"
+  type        = bool
+  default     = true
+}
+
+variable "attach_create_log_group_permission" {
+  description = "Controls whether to add the create log group permission to the CloudWatch logs policy"
   type        = bool
   default     = true
 }
@@ -617,6 +708,12 @@ variable "s3_server_side_encryption" {
   default     = null
 }
 
+variable "s3_kms_key_id" {
+  description = "Specifies a custom KMS key to use for S3 object encryption."
+  type        = string
+  default     = null
+}
+
 variable "source_path" {
   description = "The absolute path to a local file or directory containing your Lambda source code"
   type        = any # string | list(string | map(any))
@@ -665,8 +762,54 @@ variable "docker_pip_cache" {
   default     = null
 }
 
+variable "docker_additional_options" {
+  description = "Additional options to pass to the docker run command (e.g. to set environment variables, volumes, etc.)"
+  type        = list(string)
+  default     = []
+}
+
+variable "docker_entrypoint" {
+  description = "Path to the Docker entrypoint to use"
+  type        = string
+  default     = null
+}
+
 variable "recreate_missing_package" {
   description = "Whether to recreate missing Lambda package if it is missing locally or not"
   type        = bool
   default     = true
+}
+
+variable "trigger_on_package_timestamp" {
+  description = "Whether to recreate the Lambda package if the timestamp changes"
+  type        = bool
+  default     = true
+}
+
+############################################
+# Lambda Advanced Logging Settings
+############################################
+
+variable "logging_log_format" {
+  description = "The log format of the Lambda Function. Valid values are \"JSON\" or \"Text\"."
+  type        = string
+  default     = "Text"
+}
+
+variable "logging_application_log_level" {
+  description = "The application log level of the Lambda Function. Valid values are \"TRACE\", \"DEBUG\", \"INFO\", \"WARN\", \"ERROR\", or \"FATAL\"."
+  type        = string
+  default     = "INFO"
+}
+
+variable "logging_system_log_level" {
+  description = "The system log level of the Lambda Function. Valid values are \"DEBUG\", \"INFO\", or \"WARN\"."
+  type        = string
+  default     = "INFO"
+}
+
+variable "logging_log_group" {
+  description = "The CloudWatch log group to send logs to."
+  type        = string
+  default     = null
 }

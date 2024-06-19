@@ -1,7 +1,9 @@
 data "aws_partition" "current" {}
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
 
 locals {
-  create = var.create
+  create = var.create && var.putin_khuylo
 
   archive_filename        = try(data.external.archive_prepare[0].result.filename, null)
   archive_filename_string = local.archive_filename != null ? local.archive_filename : ""
@@ -22,20 +24,23 @@ locals {
 resource "aws_lambda_function" "this" {
   count = local.create && var.create_function && !var.create_layer ? 1 : 0
 
-  function_name                  = var.function_name
-  description                    = var.description
-  role                           = var.create_role ? aws_iam_role.lambda[0].arn : var.lambda_role
-  handler                        = var.package_type != "Zip" ? null : var.handler
-  memory_size                    = var.memory_size
-  reserved_concurrent_executions = var.reserved_concurrent_executions
-  runtime                        = var.package_type != "Zip" ? null : var.runtime
-  layers                         = var.layers
-  timeout                        = var.lambda_at_edge ? min(var.timeout, 30) : var.timeout
-  publish                        = var.lambda_at_edge ? true : var.publish
-  kms_key_arn                    = var.kms_key_arn
-  image_uri                      = var.image_uri
-  package_type                   = var.package_type
-  architectures                  = var.architectures
+  function_name                      = var.function_name
+  description                        = var.description
+  role                               = var.create_role ? aws_iam_role.lambda[0].arn : var.lambda_role
+  handler                            = var.package_type != "Zip" ? null : var.handler
+  memory_size                        = var.memory_size
+  reserved_concurrent_executions     = var.reserved_concurrent_executions
+  runtime                            = var.package_type != "Zip" ? null : var.runtime
+  layers                             = var.layers
+  timeout                            = var.lambda_at_edge ? min(var.timeout, 30) : var.timeout
+  publish                            = (var.lambda_at_edge || var.snap_start) ? true : var.publish
+  kms_key_arn                        = var.kms_key_arn
+  image_uri                          = var.image_uri
+  package_type                       = var.package_type
+  architectures                      = var.architectures
+  code_signing_config_arn            = var.code_signing_config_arn
+  replace_security_groups_on_destroy = var.replace_security_groups_on_destroy
+  replacement_security_group_ids     = var.replacement_security_group_ids
 
   /* ephemeral_storage is not supported in gov-cloud region, so it should be set to `null` */
   dynamic "ephemeral_storage" {
@@ -99,13 +104,65 @@ resource "aws_lambda_function" "this" {
     }
   }
 
-  tags = var.tags
+  dynamic "snap_start" {
+    for_each = var.snap_start ? [true] : []
 
-  # Depending on the log group is necessary to allow Terraform to create the log group before AWS can.
-  # When a lambda function is invoked, AWS creates the log group automatically if it doesn't exist yet.
-  # Without the dependency, this can result in a race condition if the lambda function is invoked before
-  # Terraform can create the log group.
-  depends_on = [null_resource.archive, aws_s3_object.lambda_package, aws_cloudwatch_log_group.lambda]
+    content {
+      apply_on = "PublishedVersions"
+    }
+  }
+
+  dynamic "logging_config" {
+    # Dont create logging config on gov cloud as it is not avaible.
+    # See https://github.com/hashicorp/terraform-provider-aws/issues/34810
+    for_each = data.aws_partition.current.partition == "aws" ? [true] : []
+
+    content {
+      log_group             = var.logging_log_group
+      log_format            = var.logging_log_format
+      application_log_level = var.logging_log_format == "Text" ? null : var.logging_application_log_level
+      system_log_level      = var.logging_log_format == "Text" ? null : var.logging_system_log_level
+    }
+  }
+
+  dynamic "timeouts" {
+    for_each = length(var.timeouts) > 0 ? [true] : []
+
+    content {
+      create = try(var.timeouts.create, null)
+      update = try(var.timeouts.update, null)
+      delete = try(var.timeouts.delete, null)
+    }
+  }
+
+  tags = merge(
+    { terraform-aws-modules = "lambda" },
+    var.tags,
+    var.function_tags
+  )
+
+  depends_on = [
+    null_resource.archive,
+    aws_s3_object.lambda_package,
+
+    # Depending on the log group is necessary to allow Terraform to create the log group before AWS can.
+    # When a lambda function is invoked, AWS creates the log group automatically if it doesn't exist yet.
+    # Without the dependency, this can result in a race condition if the lambda function is invoked before
+    # Terraform can create the log group.
+    aws_cloudwatch_log_group.lambda,
+
+    # Before the lambda is created the execution role with all its policies should be ready
+    aws_iam_role_policy_attachment.additional_inline,
+    aws_iam_role_policy_attachment.additional_json,
+    aws_iam_role_policy_attachment.additional_jsons,
+    aws_iam_role_policy_attachment.additional_many,
+    aws_iam_role_policy_attachment.additional_one,
+    aws_iam_role_policy_attachment.async,
+    aws_iam_role_policy_attachment.logs,
+    aws_iam_role_policy_attachment.dead_letter,
+    aws_iam_role_policy_attachment.vpc,
+    aws_iam_role_policy_attachment.tracing,
+  ]
 }
 
 resource "aws_lambda_layer_version" "this" {
@@ -115,7 +172,7 @@ resource "aws_lambda_layer_version" "this" {
   description  = var.description
   license_info = var.license_info
 
-  compatible_runtimes      = length(var.compatible_runtimes) > 0 ? var.compatible_runtimes : [var.runtime]
+  compatible_runtimes      = length(var.compatible_runtimes) > 0 ? var.compatible_runtimes : (var.runtime == "" ? null : [var.runtime])
   compatible_architectures = var.compatible_architectures
   skip_destroy             = var.layer_skip_destroy
 
@@ -139,8 +196,19 @@ resource "aws_s3_object" "lambda_package" {
   storage_class = var.s3_object_storage_class
 
   server_side_encryption = var.s3_server_side_encryption
+  kms_key_id             = var.s3_kms_key_id
 
   tags = var.s3_object_tags_only ? var.s3_object_tags : merge(var.tags, var.s3_object_tags)
+
+  dynamic "override_provider" {
+    for_each = var.s3_object_override_default_tags ? [true] : []
+
+    content {
+      default_tags {
+        tags = {}
+      }
+    }
+  }
 
   depends_on = [null_resource.archive]
 }
@@ -148,15 +216,17 @@ resource "aws_s3_object" "lambda_package" {
 data "aws_cloudwatch_log_group" "lambda" {
   count = local.create && var.create_function && !var.create_layer && var.use_existing_cloudwatch_log_group ? 1 : 0
 
-  name = "/aws/lambda/${var.lambda_at_edge ? "us-east-1." : ""}${var.function_name}"
+  name = coalesce(var.logging_log_group, "/aws/lambda/${var.lambda_at_edge ? "us-east-1." : ""}${var.function_name}")
 }
 
 resource "aws_cloudwatch_log_group" "lambda" {
   count = local.create && var.create_function && !var.create_layer && !var.use_existing_cloudwatch_log_group ? 1 : 0
 
-  name              = "/aws/lambda/${var.lambda_at_edge ? "us-east-1." : ""}${var.function_name}"
+  name              = coalesce(var.logging_log_group, "/aws/lambda/${var.lambda_at_edge ? "us-east-1." : ""}${var.function_name}")
   retention_in_days = var.cloudwatch_logs_retention_in_days
   kms_key_id        = var.cloudwatch_logs_kms_key_id
+  skip_destroy      = var.cloudwatch_logs_skip_destroy
+  log_group_class   = var.cloudwatch_logs_log_group_class
 
   tags = merge(var.tags, var.cloudwatch_logs_tags)
 }
@@ -175,7 +245,7 @@ locals {
 }
 
 resource "aws_lambda_function_event_invoke_config" "this" {
-  for_each = { for k, v in local.qualifiers : k => v if local.create && var.create_function && !var.create_layer && var.create_async_event_config }
+  for_each = { for k, v in local.qualifiers : k => v if v != null && local.create && var.create_function && !var.create_layer && var.create_async_event_config }
 
   function_name = aws_lambda_function.this[0].function_name
   qualifier     = each.key == "current_version" ? aws_lambda_function.this[0].version : null
@@ -209,12 +279,17 @@ resource "aws_lambda_permission" "current_version_triggers" {
   function_name = aws_lambda_function.this[0].function_name
   qualifier     = aws_lambda_function.this[0].version
 
-  statement_id       = try(each.value.statement_id, each.key)
-  action             = try(each.value.action, "lambda:InvokeFunction")
-  principal          = try(each.value.principal, format("%s.amazonaws.com", try(each.value.service, "")))
-  source_arn         = try(each.value.source_arn, null)
-  source_account     = try(each.value.source_account, null)
-  event_source_token = try(each.value.event_source_token, null)
+  statement_id_prefix = try(each.value.statement_id, each.key)
+  action              = try(each.value.action, "lambda:InvokeFunction")
+  principal           = try(each.value.principal, format("%s.amazonaws.com", try(each.value.service, "")))
+  principal_org_id    = try(each.value.principal_org_id, null)
+  source_arn          = try(each.value.source_arn, null)
+  source_account      = try(each.value.source_account, null)
+  event_source_token  = try(each.value.event_source_token, null)
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Error: Error adding new Lambda Permission for lambda: InvalidParameterValueException: We currently do not support adding policies for $LATEST.
@@ -223,12 +298,17 @@ resource "aws_lambda_permission" "unqualified_alias_triggers" {
 
   function_name = aws_lambda_function.this[0].function_name
 
-  statement_id       = try(each.value.statement_id, each.key)
-  action             = try(each.value.action, "lambda:InvokeFunction")
-  principal          = try(each.value.principal, format("%s.amazonaws.com", try(each.value.service, "")))
-  source_arn         = try(each.value.source_arn, null)
-  source_account     = try(each.value.source_account, null)
-  event_source_token = try(each.value.event_source_token, null)
+  statement_id_prefix = try(each.value.statement_id, each.key)
+  action              = try(each.value.action, "lambda:InvokeFunction")
+  principal           = try(each.value.principal, format("%s.amazonaws.com", try(each.value.service, "")))
+  principal_org_id    = try(each.value.principal_org_id, null)
+  source_arn          = try(each.value.source_arn, null)
+  source_account      = try(each.value.source_account, null)
+  event_source_token  = try(each.value.event_source_token, null)
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_lambda_event_source_mapping" "this" {
@@ -260,10 +340,31 @@ resource "aws_lambda_event_source_mapping" "this" {
     }
   }
 
+  dynamic "scaling_config" {
+    for_each = try([each.value.scaling_config], [])
+    content {
+      maximum_concurrency = try(scaling_config.value.maximum_concurrency, null)
+    }
+  }
+
+
   dynamic "self_managed_event_source" {
     for_each = try(each.value.self_managed_event_source, [])
     content {
       endpoints = self_managed_event_source.value.endpoints
+    }
+  }
+
+  dynamic "self_managed_kafka_event_source_config" {
+    for_each = try(each.value.self_managed_kafka_event_source_config, [])
+    content {
+      consumer_group_id = self_managed_kafka_event_source_config.value.consumer_group_id
+    }
+  }
+  dynamic "amazon_managed_kafka_event_source_config" {
+    for_each = try(each.value.amazon_managed_kafka_event_source_config, [])
+    content {
+      consumer_group_id = amazon_managed_kafka_event_source_config.value.consumer_group_id
     }
   }
 
@@ -279,8 +380,12 @@ resource "aws_lambda_event_source_mapping" "this" {
     for_each = try(each.value.filter_criteria, null) != null ? [true] : []
 
     content {
-      filter {
-        pattern = try(each.value["filter_criteria"].pattern, null)
+      dynamic "filter" {
+        for_each = try(flatten([each.value.filter_criteria]), [])
+
+        content {
+          pattern = try(filter.value.pattern, null)
+        }
       }
     }
   }
@@ -294,6 +399,7 @@ resource "aws_lambda_function_url" "this" {
   # Error: error creating Lambda Function URL: ValidationException
   qualifier          = var.create_unqualified_alias_lambda_function_url ? null : aws_lambda_function.this[0].version
   authorization_type = var.authorization_type
+  invoke_mode        = var.invoke_mode
 
   dynamic "cors" {
     for_each = length(keys(var.cors)) == 0 ? [] : [var.cors]
@@ -307,4 +413,60 @@ resource "aws_lambda_function_url" "this" {
       max_age           = try(cors.value.max_age, null)
     }
   }
+}
+
+# This resource contains the extra information required by SAM CLI to provide the testing capabilities
+# to the TF application. The required data is where SAM CLI can find the Lambda function source code
+# and what are the resources that contain the building logic.
+resource "null_resource" "sam_metadata_aws_lambda_function" {
+  count = local.create && var.create_sam_metadata && var.create_package && var.create_function && !var.create_layer ? 1 : 0
+
+  triggers = {
+    # This is a way to let SAM CLI correlates between the Lambda function resource, and this metadata
+    # resource
+    resource_name = "aws_lambda_function.this[0]"
+    resource_type = "ZIP_LAMBDA_FUNCTION"
+
+    # The Lambda function source code.
+    original_source_code = jsonencode(var.source_path)
+
+    # a property to let SAM CLI knows where to find the Lambda function source code if the provided
+    # value for original_source_code attribute is map.
+    source_code_property = "path"
+
+    # A property to let SAM CLI knows where to find the Lambda function built output
+    built_output_path = data.external.archive_prepare[0].result.filename
+  }
+
+  # SAM CLI can run terraform apply -target metadata resource, and this will apply the building
+  # resources as well
+  depends_on = [data.external.archive_prepare, null_resource.archive]
+}
+
+# This resource contains the extra information required by SAM CLI to provide the testing capabilities
+# to the TF application. The required data is where SAM CLI can find the Lambda layer source code
+# and what are the resources that contain the building logic.
+resource "null_resource" "sam_metadata_aws_lambda_layer_version" {
+  count = local.create && var.create_sam_metadata && var.create_package && var.create_layer ? 1 : 0
+
+  triggers = {
+    # This is a way to let SAM CLI correlates between the Lambda layer resource, and this metadata
+    # resource
+    resource_name = "aws_lambda_layer_version.this[0]"
+    resource_type = "LAMBDA_LAYER"
+
+    # The Lambda layer source code.
+    original_source_code = jsonencode(var.source_path)
+
+    # a property to let SAM CLI knows where to find the Lambda layer source code if the provided
+    # value for original_source_code attribute is map.
+    source_code_property = "path"
+
+    # A property to let SAM CLI knows where to find the Lambda layer built output
+    built_output_path = data.external.archive_prepare[0].result.filename
+  }
+
+  # SAM CLI can run terraform apply -target metadata resource, and this will apply the building
+  # resources as well
+  depends_on = [data.external.archive_prepare, null_resource.archive]
 }

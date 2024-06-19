@@ -5,13 +5,14 @@ locals {
   # The region part of the LogGroup ARN is then replaced with a wildcard (*) so Lambda@Edge is able to log in every region
   log_group_arn_regional = try(data.aws_cloudwatch_log_group.lambda[0].arn, aws_cloudwatch_log_group.lambda[0].arn, "")
   log_group_name         = try(data.aws_cloudwatch_log_group.lambda[0].name, aws_cloudwatch_log_group.lambda[0].name, "")
-  log_group_arn          = local.create_role && var.lambda_at_edge ? format("arn:%s:%s:%s:%s:%s", data.aws_arn.log_group_arn[0].partition, data.aws_arn.log_group_arn[0].service, "*", data.aws_arn.log_group_arn[0].account, data.aws_arn.log_group_arn[0].resource) : local.log_group_arn_regional
+  log_group_arn          = local.create_role && var.lambda_at_edge ? format("arn:%s:%s:%s:%s:%s", data.aws_arn.log_group_arn[0].partition, data.aws_arn.log_group_arn[0].service, var.lambda_at_edge_logs_all_regions ? "*" : "us-east-1", data.aws_arn.log_group_arn[0].account, data.aws_arn.log_group_arn[0].resource) : local.log_group_arn_regional
 
   # Defaulting to "*" (an invalid character for an IAM Role name) will cause an error when
   #   attempting to plan if the role_name and function_name are not set.  This is a workaround
   #   for #83 that will allow one to import resources without receiving an error from coalesce.
   # @see https://github.com/terraform-aws-modules/terraform-aws-lambda/issues/83
-  role_name = local.create_role ? coalesce(var.role_name, var.function_name, "*") : null
+  role_name   = local.create_role ? coalesce(var.role_name, var.function_name, "*") : null
+  policy_name = coalesce(var.policy_name, local.role_name, "*")
 
   # IAM Role trusted entities is a list of any (allow strings (services) and maps (type+identifiers))
   trusted_entities_services = distinct(compact(concat(
@@ -99,6 +100,7 @@ resource "aws_iam_role" "lambda" {
   force_detach_policies = var.role_force_detach_policies
   permissions_boundary  = var.role_permissions_boundary
   assume_role_policy    = data.aws_iam_policy_document.assume_role[0].json
+  max_session_duration  = var.role_maximum_session_duration
 
   tags = merge(var.tags, var.role_tags)
 }
@@ -120,7 +122,7 @@ data "aws_iam_policy_document" "logs" {
     effect = "Allow"
 
     actions = compact([
-      !var.use_existing_cloudwatch_log_group ? "logs:CreateLogGroup" : "",
+      !var.use_existing_cloudwatch_log_group && var.attach_create_log_group_permission ? "logs:CreateLogGroup" : "",
       "logs:CreateLogStream",
       "logs:PutLogEvents"
     ])
@@ -132,7 +134,7 @@ data "aws_iam_policy_document" "logs" {
 resource "aws_iam_policy" "logs" {
   count = local.create_role && var.attach_cloudwatch_logs_policy ? 1 : 0
 
-  name   = "${local.role_name}-logs"
+  name   = "${local.policy_name}-logs"
   path   = var.policy_path
   policy = data.aws_iam_policy_document.logs[0].json
   tags   = var.tags
@@ -169,7 +171,7 @@ data "aws_iam_policy_document" "dead_letter" {
 resource "aws_iam_policy" "dead_letter" {
   count = local.create_role && var.attach_dead_letter_policy ? 1 : 0
 
-  name   = "${local.role_name}-dl"
+  name   = "${local.policy_name}-dl"
   path   = var.policy_path
   policy = data.aws_iam_policy_document.dead_letter[0].json
   tags   = var.tags
@@ -196,7 +198,7 @@ data "aws_iam_policy" "vpc" {
 resource "aws_iam_policy" "vpc" {
   count = local.create_role && var.attach_network_policy ? 1 : 0
 
-  name   = "${local.role_name}-vpc"
+  name   = "${local.policy_name}-vpc"
   path   = var.policy_path
   policy = data.aws_iam_policy.vpc[0].policy
   tags   = var.tags
@@ -223,7 +225,7 @@ data "aws_iam_policy" "tracing" {
 resource "aws_iam_policy" "tracing" {
   count = local.create_role && var.attach_tracing_policy ? 1 : 0
 
-  name   = "${local.role_name}-tracing"
+  name   = "${local.policy_name}-tracing"
   path   = var.policy_path
   policy = data.aws_iam_policy.tracing[0].policy
   tags   = var.tags
@@ -260,7 +262,7 @@ data "aws_iam_policy_document" "async" {
 resource "aws_iam_policy" "async" {
   count = local.create_role && var.attach_async_event_policy ? 1 : 0
 
-  name   = "${local.role_name}-async"
+  name   = "${local.policy_name}-async"
   path   = var.policy_path
   policy = data.aws_iam_policy_document.async[0].json
   tags   = var.tags
@@ -280,7 +282,7 @@ resource "aws_iam_role_policy_attachment" "async" {
 resource "aws_iam_policy" "additional_json" {
   count = local.create_role && var.attach_policy_json ? 1 : 0
 
-  name   = local.role_name
+  name   = local.policy_name
   path   = var.policy_path
   policy = var.policy_json
   tags   = var.tags
@@ -300,7 +302,7 @@ resource "aws_iam_role_policy_attachment" "additional_json" {
 resource "aws_iam_policy" "additional_jsons" {
   count = local.create_role && var.attach_policy_jsons ? var.number_of_policy_jsons : 0
 
-  name   = "${local.role_name}-${count.index}"
+  name   = "${local.policy_name}-${count.index}"
   path   = var.policy_path
   policy = var.policy_jsons[count.index]
   tags   = var.tags
@@ -384,7 +386,7 @@ data "aws_iam_policy_document" "additional_inline" {
 resource "aws_iam_policy" "additional_inline" {
   count = local.create_role && var.attach_policy_statements ? 1 : 0
 
-  name   = "${local.role_name}-inline"
+  name   = "${local.policy_name}-inline"
   path   = var.policy_path
   policy = data.aws_iam_policy_document.additional_inline[0].json
   tags   = var.tags
